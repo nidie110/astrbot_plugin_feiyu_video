@@ -13,6 +13,12 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+import sys as _sys
+
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+_sys.modules.pop("_feiyu_kit", None)  # 顶层模块名，重载插件时先清缓存再导，避免用到旧字节
+import _feiyu_kit as kit  # noqa: E402
+
 import imageio_ffmpeg
 from PIL import Image
 import astrbot.api.message_components as Comp
@@ -22,6 +28,64 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_NAME = "astrbot_plugin_feiyu_video"
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+# 描述腔黑名单：出现这些就不是「她说话」，是「播报」
+_BANNED_PHRASES = (
+    "这个视频", "这段视频", "该视频", "视频中", "视频里", "画面中", "画面里",
+    "展示了", "介绍了", "讲述了", "呈现了", "可以看到", "本视频",
+)
+
+_STYLE_RULES = """你在跟朋友聊天，刚看完他甩来的东西。写一条消息，规则：
+- 第一句必须是你的反应或判断（笑死/我服了/这个我熟/有点意思/看不懂但大受震撼…），不是描述
+- 绝对不要出现：这个视频、这段视频、视频里、画面中、展示了、介绍了、讲述了、可以看到
+- 最多两句，加起来不超过 60 个字；能一句说完就一句
+- 说人话，口语，可以有情绪、可以吐槽、可以顺手联想到自己或对方
+- 不许 Markdown、书名号堆叠、分点、标题、堆感叹号
+- 认不出是谁/哪部作品就直说认不出，别编
+- 如果对方问了具体问题：先用不超过 20 字答那个问题，再补一句你的看法"""
+
+
+def _facts_prompt(note: str, n_frames: int) -> str:
+    """让视觉模型只交事实，不交感想——感想留给人格那一步。"""
+    head = (note + "\n") if note else ""
+    return (
+        head
+        + f"这些是从一段视频里按时间顺序抽取的 {n_frames} 帧画面。请提取事实，严格输出 JSON，不要多余文字：\n"
+        '{"类型":"新闻/动漫/游戏/影视/生活/教学/其他",'
+        '"主题":"一句话说这条视频在讲什么",'
+        '"人物":["画面里出现的人，能认出来就写名字，认不出写身份描述"],'
+        '"时间":"画面里能读到的日期或时间点，没有就空",'
+        '"地点":"画面里能读到的地点或场景，没有就空",'
+        '"作品":"如果是动漫/影视/游戏，写作品名，不确定就空",'
+        '"角色":["作品里的角色名或外形描述"],'
+        '"事件":"如果是新闻，写发生了什么；不是新闻就空",'
+        '"画面文字":["画面上出现的字幕、标题、牌匾、弹幕逐条列出"],'
+        '"氛围":"搞笑/严肃/激烈/温情/日常"}\n'
+        "只写画面里能看到的，不确定的字段留空字符串或空数组，绝对不要编。"
+    )
+
+
+def _facts_brief(facts: dict, note: str) -> str:
+    """整理成给主模型看的一段紧凑事实，并说明「这是你看到的」。"""
+    def _j(key):
+        val = facts.get(key)
+        if isinstance(val, list):
+            val = "、".join(str(x) for x in val if str(x).strip())
+        return str(val or "").strip()
+
+    bits = []
+    for key in ("类型", "主题", "作品", "角色", "人物", "事件", "时间", "地点", "画面文字", "氛围"):
+        val = _j(key)
+        if val:
+            bits.append(f"{key}：{val[:180]}")
+    for key in ("识图结果", "搜番结果", "搜索补充"):
+        val = _j(key)
+        if val:
+            bits.append(f"{key}：{val[:120]}")
+    if note:
+        bits.append(f"来源页信息：{note[:150]}")
+    head = "（这是你看画面看到的，不是别人转述）"
+    return head + ("\n" + "\n".join(bits) if bits else "\n（画面没给出可用信息）")
 
 # 机器相关的路径和密钥都不写进代码：走插件配置（_conf_schema.json）或 plugin_data/config.json。
 DEFAULT_CONFIG = {
@@ -55,6 +119,12 @@ DEFAULT_CONFIG = {
     # 截几帧、页面打开后等几秒
     "browser_shots": 4,
     "browser_settle": 5,
+    # ---- 让她自己看：帧直接进主模型的请求，我不替她转述 ----
+    "see_with_llm": True,
+    "see_shots": 3,
+    "see_cache_seconds": 600,
+    # 一条链接最多等多久（秒）；超时就不带帧，别把整条消息卡死
+    "see_timeout": 90,
 }
 
 
@@ -84,6 +154,8 @@ class FeiyuVideo(Star):
         # 链接看片：同一时刻最多两条，最近 60 秒看过的直接复用
         self._video_sem = asyncio.Semaphore(2)
         self._recent_links: dict[str, tuple[float, list[str], str]] = {}
+        # 「让她自己看」的帧缓存：ref -> (时间戳, 帧路径, 页面信息)
+        self._see_cache: dict[str, tuple[float, list[str], str]] = {}
         self._cfg_lock = threading.Lock()
         self._sweep_leftovers()
 
@@ -219,20 +291,7 @@ class FeiyuVideo(Star):
         return any(path.endswith(ext) for ext in self._MEDIA_EXT)
 
     def _ytdlp_exe(self) -> str:
-        cfg = str(self.cfg.get("yt_dlp") or "").strip()
-        if cfg and Path(cfg).exists():
-            return cfg
-        found = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-        if found:
-            return found
-        for cand in (
-            str(Path.home() / ".agent-reach-venv" / "Scripts" / "yt-dlp.exe"),
-            str(Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "yt-dlp" / "Scripts" / "yt-dlp.exe"),
-            str(Path.home() / "AppData" / "Local" / "Programs" / "Python" / "Scripts" / "yt-dlp.exe"),
-        ):
-            if Path(cand).exists():
-                return cand
-        return ""
+        return kit.find_ytdlp(str(self.cfg.get("yt_dlp") or ""))
 
     def _ytdlp_fetch(self, url: str) -> str:
         """yt-dlp 下前 N 秒，返回本地 mp4 路径；失败抛异常（细节只进日志）。"""
@@ -349,6 +408,96 @@ class FeiyuVideo(Star):
                 logger.warning(f"[feiyu_video] bsk 会话没停掉 sid={sid}: {e}")
         return str(info.get("title") or "")[:120], str(info.get("desc") or "")[:300], shots
 
+    # ---------- 说话的口气 ----------
+
+    def _persona_dir(self) -> Path:
+        """persona_mind 的数据目录：配置优先，没配就按同级插件推断。"""
+        raw = str(self.cfg.get("persona_data_dir") or "").strip()
+        if raw:
+            return Path(raw)
+        return Path(__file__).resolve().parent.parent.parent / "plugin_data" / "astrbot_plugin_persona_mind"
+
+    def _persona_brief(self) -> str:
+        """借人格的味道：几句语料样本 + 当前心情。读不到就返回空串。"""
+        import time as _time
+        cache = getattr(self, "_persona_cache", None)
+        now = _time.time()
+        if cache and now - cache[0] < 600:
+            return cache[1]
+        brief = ""
+        try:
+            base = self._persona_dir()
+            lines = []
+            vf = base / "kb" / "voice.md"
+            if vf.exists():
+                for ln in vf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    t = ln.strip()
+                    if not t or t.startswith(("#", ">", "-")):
+                        continue
+                    lines.append(t)
+                    if len(lines) >= 8:
+                        break
+            mood = ""
+            pf = base / "pad.json"
+            if pf.exists():
+                try:
+                    pad = _json.loads(pf.read_text(encoding="utf-8-sig"))
+                    if isinstance(pad, dict):
+                        v = pad.get("valence", pad.get("v"))
+                        if isinstance(v, (int, float)):
+                            mood = "现在心情不错" if v >= 20 else ("现在心情一般" if v > -20 else "现在心情不太好")
+                except Exception:
+                    pass
+            if lines:
+                brief = "她平时说话的样子（借味道，别照抄）：\n" + "\n".join(f"- {x}" for x in lines)
+                if mood:
+                    brief += "\n" + mood + "。"
+        except Exception as e:
+            logger.debug(f"[feiyu_video] 读人格语料失败: {e}")
+        self._persona_cache = (now, brief)
+        return brief
+
+    def _style_broken(self, text: str) -> bool:
+        return any(p in (text or "") for p in _BANNED_PHRASES)
+
+    def _strip_descriptive(self, text: str) -> str:
+        """兜底：把描述腔的句子删掉，剩下的话才是她想说的。"""
+        parts = re.split(r"(?<=[。！？!?~\n])", (text or "").strip())
+        keep = [p for p in parts if p.strip() and not self._style_broken(p)]
+        return "".join(keep).strip()
+
+    async def _speak(self, facts_text: str, history: str = "", question: str = "") -> str:
+        """把事实换成人格口吻的一两句。失败返回空串，调用方自己兜底。"""
+        if not self.cfg.get("rewrite", True):
+            return ""
+        brief = self._persona_brief()
+        ask = ("\n对方的问题：" + question + "\n（先用不超过 20 字答这个，再补一句你的看法）") if question else ""
+        base_prompt = (
+            _STYLE_RULES + "\n\n" + brief + "\n\n"
+            + "你们刚才的聊天：\n" + (history or "（没什么上下文）") + "\n\n"
+            + "从画面里提取到的事实：\n" + facts_text + ask
+        )
+        for attempt in range(2):
+            prompt = base_prompt if attempt == 0 else (
+                base_prompt + "\n\n上次那版太像播报了。重写：第一句直接是你的反应，别再出现视频/画面/展示这类词。"
+            )
+            try:
+                rw = await self.context.llm_generate(
+                    chat_provider_id=self.cfg.get("rewrite_provider", "deepseek/deepseek-flash"),
+                    prompt=prompt,
+                )
+                spoken = (rw.completion_text or "").strip()
+            except Exception as e:
+                logger.warning(f"[feiyu_video] 转述失败: {e}")
+                return ""
+            if spoken and not self._style_broken(spoken):
+                return spoken.strip('"“”')
+            if spoken:
+                cleaned = self._strip_descriptive(spoken)
+                if cleaned:
+                    return cleaned.strip('"“”')
+        return ""
+
     def _crop_video_area(self, shot: str, info: dict, out: Path) -> str:
         """按 video 元素 rect 裁出画面；算不准就整张用，宁可糙也别裁错。"""
         try:
@@ -414,6 +563,9 @@ class FeiyuVideo(Star):
 
             if not self.cfg.get("browser_fallback", True):
                 raise RuntimeError("no-fallback")
+            if self._platform(url) == "other":
+                # 直链媒体只走 yt-dlp：别拿登录态的浏览器去开任意域名
+                raise RuntimeError("not-platform")
 
             title, desc, shots = await asyncio.wait_for(
                 asyncio.to_thread(self._bsk_grab, url), timeout=180)
@@ -423,6 +575,119 @@ class FeiyuVideo(Star):
             logger.info(f"[feiyu_video] 浏览器截帧 {len(shots)} 张: {url}")
             self._recent_links[url] = (now, shots, note.strip())
             return shots, note.strip()
+
+    # ---------- 让她自己看 ----------
+
+    def _main_supports_image(self, event: AstrMessageEvent) -> bool:
+        """主模型这一路到底收不收图；判断不了就当作支持（AstrBot 默认全支持）。"""
+        try:
+            provider = self.context.get_using_provider(getattr(event, "unified_msg_origin", None))
+            if provider is None:
+                return False
+            mods = provider.provider_config.get("modalities")
+            if not mods:
+                # 没声明就按不支持处理：宁可退回「插件看完再转述」，也不要把图塞给纯文本模型
+                return False
+            return "image" in mods
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 判断主模型能力失败: {e}")
+            return False
+
+    def _link_in_message(self, msg: str) -> str | None:
+        for raw in re.findall(r"https?://[^\s<>【】（）「」]+", msg or ""):
+            url = self._norm_url(raw.rstrip("，。！？；：、,.!?"))
+            if self._allowed(url):
+                return url
+        return None
+
+    async def _frames_for_llm(self, ref: str) -> tuple[list[str], str]:
+        """按链接或本地文件取帧；同一份看过的在 see_cache_seconds 内直接复用。"""
+        ref = (ref or "").strip()
+        if not ref:
+            return [], ""
+        if not ref.startswith(("http://", "https://")) and re.match(r"^[\w.-]+\.[a-z]{2,6}/", ref):
+            ref = "https://" + ref
+        now = time.time()
+        ttl = max(30, int(self.cfg.get("see_cache_seconds") or 600))
+        if ref.startswith(("http://", "https://")):
+            parts = urllib.parse.urlsplit(ref)
+            key = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        else:
+            key = ref
+        hit = self._see_cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1], hit[2]
+        if ref.startswith(("http://", "https://")):
+            frames, note = await self._frames_from_url(ref)
+        else:
+            path = self._resolve_local(ref)
+            if not path or not os.path.exists(path):
+                return [], ""
+            frames = await asyncio.to_thread(self._frames, path)
+            note = ""
+        self._see_cache[key] = (now, list(frames), note)
+        if len(self._see_cache) > 60:
+            for k in sorted(self._see_cache, key=lambda x: self._see_cache[x][0])[:20]:
+                self._see_cache.pop(k, None)
+        return frames, note
+
+    @filter.on_llm_request()
+    async def see_frames_with_llm(self, event: AstrMessageEvent, req) -> None:
+        """他要她看看这条视频：把抽出来的帧塞进这一次请求，让她自己看、自己说。"""
+        if not self.cfg.get("see_with_llm", True):
+            return
+        msg = (event.message_str or "").strip()
+        if msg.startswith("/"):
+            return
+        if not self._main_supports_image(event):
+            return
+        # 只发视频（QQ 里 message_str 是空串）走组件；只发链接走文本
+        ref = self._video_ref(event) or self._link_in_message(msg)
+        if not ref:
+            return
+        try:
+            frames, note = await asyncio.wait_for(
+                self._frames_for_llm(ref),
+                timeout=float(self.cfg.get("see_timeout") or 90),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[feiyu_video] 自己看：取帧超时 {ref[:80]}")
+            return
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 自己看：取帧失败 {ref[:80]}: {e}")
+            return
+        if not frames:
+            return
+        picked = list(frames)[: max(1, int(self.cfg.get("see_shots") or 3))]
+        # 只给这一轮看：_no_save 让框架别把这几张图写进会话历史、别每轮重发
+        try:
+            from astrbot.core.agent.message import ImageURLPart
+        except Exception:  # 老版本没有这个类，退回老写法
+            ImageURLPart = None
+        if ImageURLPart is not None:
+            if not isinstance(req.extra_user_content_parts, list):
+                req.extra_user_content_parts = []
+            for p in picked:
+                part = ImageURLPart(image_url=ImageURLPart.ImageURL(url=p))
+                try:
+                    part._no_save = True
+                except Exception:
+                    pass
+                req.extra_user_content_parts.append(part)
+        else:
+            req.image_urls = list(req.image_urls or []) + picked
+        hint = ("\n\n（他发来的是视频/视频链接，上面那几张就是从里面按时间顺序截的画面，你能直接看到。"
+                "用你自己的口气回他——别用「视频里展示了…」这种播报腔，也别复述字段名。"
+                "要是你其实没看到图，就直说你没看清。）")
+        if note:
+            hint += f"\n（页面自带的说明，仅供参考，不算你看到的：{note[:200]}）"
+        req.system_prompt = (req.system_prompt or "") + hint
+        self._last_frames[event.unified_msg_origin] = picked
+        try:
+            event.set_extra("feiyu_saw_frames", ref)
+        except Exception:
+            pass
+        logger.info(f"[feiyu_video] 画面已交给主模型: {len(picked)} 帧 · {ref[:80]}")
 
     @staticmethod
     def _user_hint(e: Exception) -> str:
@@ -440,6 +705,8 @@ class FeiyuVideo(Star):
             return "浏览器没起来，等会儿再试"
         if "no-video-element" in s:
             return "页面打开了，但没找到视频画面"
+        if "not-platform" in s:
+            return "这个链接我不开浏览器看，只认视频站和直链"
         if "no-fallback" in s:
             return "这条下不下来，浏览器兜底又关着"
         return "这条链接我打不开"
@@ -491,21 +758,28 @@ class FeiyuVideo(Star):
     # ---------- LLM 工具 ----------
 
     @filter.llm_tool(name="watch_video")
-    async def watch_video(self, event: AstrMessageEvent, video_ref: str, question: str = ""):
-        """看一段视频：抽取关键画面，交给视觉模型，然后回答关于视频的问题。
+    async def watch_video(self, event: AstrMessageEvent, video_ref: str, question: str = "") -> str:
+        """看一段视频，把画面里的事实交给你。
 
         什么时候用：用户发来视频、**发来 B站/抖音/快手/小红书/YouTube 的页面链接**、
-        问"这个视频讲了什么"、让你看视频里的动作/场景/字幕，或者要你评价视频内容时。
-        页面链接直接传进来就行，插件会自己想办法把画面拿到。
+        问"这个视频讲了什么"、让你看视频里的动作/场景/字幕，或者要你评价时。
+        页面链接直接传进来就行，插件会自己想办法拿到画面。
+
+        返回值是画面里的事实（主题/人物/作品/画面文字等），**紧接着就该用你自己的口气回话**，
+        不要复述字段名，也不要把它当成已经回给用户的答复。
 
         Args:
             video_ref(string): 视频的本地路径，或 http(s) 链接（可以是 B站/抖音这类网页链接）
-            question(string): 想从视频里知道什么；不填就概括视频内容
+            question(string): 想从视频里知道什么；不填就按画面给一段事实
         """
         video_ref = (video_ref or "").strip().strip("'\"")
+        try:
+            if event.get_extra("feiyu_saw_frames"):
+                return "画面已经在这一轮的请求里了（你能直接看到）：按你看到的用你自己的口气回他，别复述字段名。"
+        except Exception:
+            pass
         if not video_ref:
-            yield event.plain_result("要我看哪个视频？")
-            return
+            return "他没给视频地址。问他要一下。"
 
         note = ""
         frames: list[str] = []
@@ -513,48 +787,59 @@ class FeiyuVideo(Star):
             video_ref = self._norm_url(video_ref)
             is_link = video_ref.startswith(("http://", "https://"))
             if is_link and not self._is_media_url(video_ref):
-                # B站/抖音这种网页：先 yt-dlp，再退浏览器截帧
+                if not self._allowed(video_ref):
+                    return "这个链接不在能打开的站点里（内网或陌生站点），直说打不开。"
                 frames, note = await self._frames_from_url(video_ref)
             else:
                 path = video_ref
                 if is_link:
+                    if not self._allowed(video_ref):
+                        return "这个链接不在能打开的站点里，直说打不开。"
                     path = await asyncio.to_thread(self._download, video_ref)
                 if not os.path.exists(path):
-                    yield event.plain_result(f"找不到视频文件：{path}")
-                    return
+                    return f"没找到这个视频文件（{os.path.basename(path)}）。直说没拿到。"
                 frames = await asyncio.to_thread(self._frames, path)
         except Exception as e:
             logger.exception(f"[feiyu_video] 处理视频失败: {video_ref}")
-            yield event.plain_result(self._user_hint(e))
-            return
+            return self._user_hint(e)
 
         if not frames:
-            yield event.plain_result("这个视频抽不出画面，可能格式不支持")
-            return
+            return "画面抽不出来。直说这次没看成。"
 
-        q = (question or "").strip() or "概括这段视频的内容：发生了什么、画面里有什么、氛围如何。"
-        prompt = (
-            (f"{note}\n" if note else "")
-            + f"这些是从一段视频里按时间顺序抽取的 {len(frames)} 帧画面。\n"
-            f"用户的问题：{q}\n"
-            "请只根据画面回答，具体、简要，不要编造画面里没有的东西。"
-        )
-
+        q = (question or "").strip()
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=self.cfg.get("vision_provider_id", "deepseek/deepseek-vision"),
-                prompt=prompt,
+                prompt=_facts_prompt(note, len(frames)),
                 image_urls=frames,
             )
             text = (resp.completion_text or "").strip()
         except Exception as e:
             logger.error(f"[feiyu_video] 视觉调用失败: {e}")
-            yield event.plain_result(f"看视频时出错了：{type(e).__name__}")
-            return
+            return f"看画面时出错了（{type(e).__name__}）。这次没看成，别编内容。"
 
         if not text:
-            text = "看完了，但没看出什么名堂。"
-        yield event.plain_result(text[:800])
+            return "画面拿到了，但什么都没读出来。直说没看成就行。"
+
+        facts = None
+        try:
+            m = re.search(r"\{.*\}", text, re.S)
+            if m:
+                facts = json.loads(m.group(0))
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 视觉 JSON 解析失败: {e}")
+
+        if isinstance(facts, dict) and facts:
+            brief = _facts_brief(facts, note)
+        else:
+            brief = "（这是你看画面看到的，不是别人转述）\n" + text[:800]
+
+        if q:
+            brief += "\n\n对方问的是：" + q
+        brief += "\n\n（这些是你看画面得到的事实：接下来用你自己的口气回他，别复述字段名。）"
+        self._last_frames[event.unified_msg_origin] = list(frames or [])[:3]
+        logger.info(f"[feiyu_video] 画面事实已交回模型: {len(brief)} 字")
+        return brief
 
     # ---------- 收到视频自动看 ----------
 
@@ -656,6 +941,10 @@ class FeiyuVideo(Star):
         """收到视频就直接处理：不发中间消息，最后一次性 send，避免被别的插件截断。"""
         ref = self._video_ref(event)
         if not ref:
+            return
+        # 主模型能看图时，不拦事件：把帧塞进请求，让她自己回（see_frames_with_llm）
+        if self.cfg.get("see_with_llm", True) and self._main_supports_image(event):
+            logger.info("[feiyu_video] 交给主模型自己看，不再代发")
             return
         event.stop_event()
 
@@ -788,29 +1077,11 @@ class FeiyuVideo(Star):
         history = self._recent_history(event)
         fact_text = json.dumps(facts, ensure_ascii=False)[:1500]
 
-        spoken = None
-        if self.cfg.get("rewrite", True):
-            try:
-                rw = await self.context.llm_generate(
-                    chat_provider_id=self.cfg.get("rewrite_provider", "deepseek/deepseek-flash"),
-                    prompt=(
-                        "你刚看完一段视频。下面是从画面里提取的事实，以及你们刚才的聊天记录。\n"
-                        "用你们平时的说话方式回一条消息：1~3 个短句，每句不超过 20 字，口语，可以带情绪或吐槽。\n"
-                        "要求：\n"
-                        "- 说清楚是什么（新闻/动漫/游戏/谁/哪部作品），别含糊\n"
-                        "- 如果认不出是谁/哪部作品，就直说认不出，别编\n"
-                        "- 不要 Markdown、加粗、分点、标题、感叹号堆砌\n"
-                        "- 不要'这段视频展示了'这种开头\n"
-                        "- 结合聊天记录里的语境，像接话一样说\n\n"
-                        f"聊天记录：\n{history}\n\n事实：\n{fact_text}"
-                    ),
-                )
-                spoken = (rw.completion_text or "").strip()
-            except Exception as e:
-                logger.warning(f"[feiyu_video] 转述失败: {e}")
+        spoken = await self._speak(fact_text, history)
 
         if not spoken:
-            spoken = "看完了：" + str(facts.get("主题") or "")
+            theme = str(facts.get("主题") or "").strip()
+            spoken = ("看完了，" + theme) if theme and len(theme) <= 40 else "看完了，但我说不好这是啥，你再问我细节？"
 
         self._last_frames[event.unified_msg_origin] = list(frames or [])[:3]
         final = (spoken or "看完了，没看出什么名堂。")[:300]
