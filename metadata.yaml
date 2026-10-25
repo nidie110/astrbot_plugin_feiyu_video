@@ -4,7 +4,7 @@ desc: "抽帧交给视觉模型，让 bot 能真的看懂视频；认不出时�
 help: "把视频发给她并问「这视频讲了什么」；或 /看视频 <路径或链接>；/识图 认图"
 version: 1.1.0
 author: "部署助手"
-repo: ""
+repo: "https://github.com/nidie110/astrbot_plugin_feiyu_video"
 astrbot_version: ">=4.11.0"
 tags:
   - 视频
