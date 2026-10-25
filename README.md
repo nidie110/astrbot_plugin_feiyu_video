@@ -10,12 +10,33 @@
 - **口吻重写**：可选把「事实描述」重写成人格说话方式，避免念说明书
 - **两种入口**：群里直接甩视频，或 `/看视频 <路径或链接>`
 
+## 网页链接也能看（1.2.0）
+
+以前只认两样东西：QQ 发来的视频文件、直链 mp4。别人甩一条 `https://www.bilibili.com/video/BV...` 或抖音分享链，她会当成文件去下载，下回来一堆 HTML，然后说「这个视频打不开」。
+
+现在遇到页面链接，按两条路走：
+
+1. **yt-dlp 下前 N 秒**（默认 30 秒、480p）——B 站这类能直接下的，2 秒就能拿到画面
+2. **下不下来就让浏览器去看**——用 bsk 打开页面，找到 `video` 元素，把画面区域按时间截几张图（默认 4 张），连标题和简介一起交给视觉模型
+
+第二条是关键：抖音这类站点不给 cookies 就不发视频流（`Fresh cookies (not necessarily logged in) are needed`），而浏览器里是登录状态，页面能正常播——截图就等于「真的看了」。截完会用 video 元素的坐标裁掉黑边和推荐栏，只留画面。
+
+| 站点 | 走哪条 |
+|---|---|
+| B站（含 b23.tv 短链） | yt-dlp |
+| 抖音（含 v.douyin.com 短链） | 直接走浏览器截帧（没配 cookies 时不白试 yt-dlp） |
+| 快手 / 小红书 / YouTube | 没配 cookies 直接浏览器；配了就先 yt-dlp |
+| 直链 .mp4 / .webm | 直接下载抽帧（老路） |
+
+相关配置：`yt_dlp`、`ytdlp_seconds`、`ytdlp_height`、`cookies_browser`、`browser_fallback`、`browser_shots`、`browser_settle`。
+
 ## 安装
 
 1. `pip install -r requirements.txt`（`imageio-ffmpeg`、`Pillow`）
-2. 目录放到 `astrbot/data/plugins/`
-3. 配置里填 `vision_provider_id`（AstrBot 里已配好的多模态模型 id）
-4. 重启 AstrBot
+2. 想看 B 站这类链接，还要 `pip install yt-dlp`（不装也能用：抖音走浏览器，其他站点会提示「得先装 yt-dlp」）
+3. 目录放到 `astrbot/data/plugins/`
+4. 配置里填 `vision_provider_id`（AstrBot 里已配好的多模态模型 id）
+5. 重启 AstrBot
 
 ## 配置
 
@@ -52,3 +73,13 @@
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
+
+## 安全边界
+
+这条链路会驱动 bsk（日常那个浏览器，带登录态），所以做了闸门：
+
+- 只认上表里的站点域名（按 host 后缀匹配，`bilibili.com.evil.com`、`evil.com/?u=bilibili.com` 都不算）
+- 内网地址一律拒：`127.*`、`10.*`、`192.168.*`、`169.254.*`、`172.16-31.*`、`localhost`
+- 直链媒体文件（`.mp4` 等）也放行，但同样过内网过滤
+
+想加站点就改 `_PLATFORM_HOSTS`，别把闸门删了。

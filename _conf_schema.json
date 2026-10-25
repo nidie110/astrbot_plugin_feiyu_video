@@ -102,5 +102,89 @@
     "description": "搜索接口地址",
     "type": "string",
     "default": "https://api.deepseek.com/v1/tools/search"
+  },
+  "_sec_link": {
+    "description": "=== 网页链接（B站/抖音等） ===",
+    "type": "text",
+    "invisible": true
+  },
+  "yt_dlp": {
+    "description": "yt-dlp 路径",
+    "type": "text",
+    "default": "",
+    "hint": "留空会自动找 PATH 与常见安装位置；找不到就得填，比如 .agent-reach-venv\\Scripts\\yt-dlp.exe。"
+  },
+  "ytdlp_seconds": {
+    "description": "只下载前几秒",
+    "type": "int",
+    "default": 30,
+    "slider": {
+      "min": 5,
+      "max": 300,
+      "step": 5
+    },
+    "hint": "整条视频又慢又占盘，看开头几十秒通常就够判断内容。"
+  },
+  "ytdlp_height": {
+    "description": "下载画质上限",
+    "type": "int",
+    "default": 480,
+    "slider": {
+      "min": 144,
+      "max": 1080,
+      "step": 16
+    },
+    "hint": "视觉模型吃不了太大的图，480 足够。"
+  },
+  "cookies_browser": {
+    "description": "从哪个浏览器取 cookies",
+    "type": "string",
+    "default": "",
+    "options": [
+      "",
+      "edge",
+      "chrome",
+      "firefox"
+    ],
+    "labels": [
+      "不带",
+      "Edge",
+      "Chrome",
+      "Firefox"
+    ],
+    "hint": "抖音这类站点要 cookies 才肯给视频；浏览器正开着时可能读不到（数据库被占），那就靠下面的浏览器兜底。"
+  },
+  "browser_fallback": {
+    "description": "下不下来时用浏览器截帧",
+    "type": "bool",
+    "default": true,
+    "hint": "用 bsk 打开页面，把画面区域截几张图交给视觉模型。抖音基本走这条路。"
+  },
+  "browser_shots": {
+    "description": "浏览器截几帧",
+    "type": "int",
+    "default": 4,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "condition": {
+      "browser_fallback": true
+    }
+  },
+  "browser_settle": {
+    "description": "打开页面后等几秒",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    },
+    "condition": {
+      "browser_fallback": true
+    },
+    "hint": "等页面把播放器渲染出来再截。"
   }
 }

@@ -3,14 +3,18 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
 
 import imageio_ffmpeg
+from PIL import Image
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -37,6 +41,20 @@ DEFAULT_CONFIG = {
     # 联网补充信息（key 留空则不联网）
     "search_key": "",
     "search_api": "https://api.deepseek.com/v1/tools/search",
+    # ---- 网页链接（B站/抖音/快手/小红书）----
+    # yt-dlp 可执行文件；留空则查 PATH 和几个常见安装位置
+    "yt_dlp": "",
+    # 只下前这么多秒（下整条又慢又占磁盘）
+    "ytdlp_seconds": 30,
+    # 下载画质上限，够视觉模型看就行
+    "ytdlp_height": 480,
+    # 某些站要 cookies（如抖音）：edge / chrome / firefox，留空则不带
+    "cookies_browser": "",
+    # yt-dlp 拿不到时，用 bsk 浏览器开页面截帧
+    "browser_fallback": True,
+    # 截几帧、页面打开后等几秒
+    "browser_shots": 4,
+    "browser_settle": 5,
 }
 
 
@@ -63,12 +81,44 @@ class FeiyuVideo(Star):
             # 插件配置优先于本地 config.json，空值不覆盖
             self.cfg.update({k: v for k, v in self.plugin_cfg.items() if v not in (None, "")})
         self.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        # 链接看片：同一时刻最多两条，最近 60 秒看过的直接复用
+        self._video_sem = asyncio.Semaphore(2)
+        self._recent_links: dict[str, tuple[float, list[str], str]] = {}
+        self._cfg_lock = threading.Lock()
+        self._sweep_leftovers()
+
+    def _sweep_leftovers(self) -> None:
+        """启动时扫一遍：过期的抽帧目录、上次没收掉的临时视频。"""
+        now = time.time()
+        try:
+            root = self.data_dir / "frames"
+            if root.is_dir():
+                for d in root.iterdir():
+                    try:
+                        if d.is_dir() and now - d.stat().st_mtime > 24 * 3600:
+                            shutil.rmtree(d, ignore_errors=True)
+                    except OSError:
+                        continue
+        except OSError as e:
+            logger.warning(f"[feiyu_video] 清理抽帧目录失败: {e}")
+        try:
+            for p in Path(tempfile.gettempdir()).glob("feiyu_video_*"):
+                try:
+                    if now - p.stat().st_mtime > 6 * 3600:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    continue
+        except OSError as e:
+            logger.warning(f"[feiyu_video] 清理临时视频失败: {e}")
 
     def _save_cfg(self) -> None:
         """把当前配置（除插件配置外的本地值）落盘，下次启动直接用。"""
         try:
-            self.cfg_path.write_text(
-                json.dumps(self.cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with self._cfg_lock:
+                tmp = self.cfg_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+                os.replace(tmp, self.cfg_path)
         except Exception as e:
             logger.warning(f"[feiyu_video] 保存配置失败: {e}")
 
@@ -91,9 +141,308 @@ class FeiyuVideo(Star):
             return
         try:
             Path(path).unlink(missing_ok=True)
+            for extra in Path(path).parent.glob(Path(path).name + ".*"):
+                extra.unlink(missing_ok=True)       # .part / .part-Frag*
             self._temporary_files.discard(path)
         except OSError as e:
             logger.warning(f"[feiyu_video] 临时文件清理失败: {e}")
+
+    # ---------- 网页链接：B 站 / 抖音 / 快手 / 小红书 ----------
+    #
+    # 两条路：yt-dlp 下前 N 秒；下不下来就 bsk 开页面截帧。
+    # 注意：页面链接只放行下面这张表里的站点——bsk 用的是日常那个浏览器，
+    # 带着登录态，不能让它去开任意 URL（内网地址、面板地址一律拒）。
+
+    _MEDIA_EXT = (".mp4", ".m4v", ".mov", ".webm", ".flv", ".mkv", ".ts")
+
+    _PLATFORM_HOSTS = {
+        "bilibili": ("bilibili.com", "b23.tv", "bili2233.cn", "bili22.cn"),
+        "douyin": ("douyin.com", "iesdouyin.com"),
+        "kuaishou": ("kuaishou.com", "kuaishouapp.com", "chenzhongtech.com"),
+        "xiaohongshu": ("xiaohongshu.com", "xhslink.com"),
+        "youtube": ("youtube.com", "youtu.be", "ytimg.com"),
+    }
+
+    @staticmethod
+    def _norm_url(url: str) -> str:
+        """补 scheme：分享文案里常见 v.douyin.com/xxx/ 这种裸链接。"""
+        u = (url or "").strip()
+        if u and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
+            if re.match(r"^[\w.-]+\.[a-zA-Z]{2,}(/|$|\?)", u):
+                u = "https://" + u
+        return u
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return (urllib.parse.urlparse(url).hostname or "").lower()
+        except Exception:
+            return ""
+
+    def _platform(self, url: str) -> str:
+        """按 host 后缀匹配（不是整串子串，否则 evil.com/?u=bilibili.com 会混进来）。"""
+        host = self._host(self._norm_url(url))
+        for name, domains in self._PLATFORM_HOSTS.items():
+            if any(host == d or host.endswith("." + d) for d in domains):
+                return name
+        return "other"
+
+    @staticmethod
+    def _private_host(host: str) -> bool:
+        if not host:
+            return True
+        if host in ("localhost", "0.0.0.0", "[::1]", "::1"):
+            return True
+        if host.startswith(("127.", "10.", "192.168.", "169.254.", "0.")):
+            return True
+        if host.startswith("172."):
+            try:
+                if 16 <= int(host.split(".")[1]) <= 31:
+                    return True
+            except (ValueError, IndexError):
+                return True
+        return False
+
+    def _allowed(self, url: str) -> bool:
+        """闸门：只放行白名单站点，以及直链媒体文件。"""
+        u = self._norm_url(url)
+        if self._private_host(self._host(u)):
+            return False
+        return self._platform(u) != "other" or self._is_media_url(u)
+
+    def _is_media_url(self, url: str) -> bool:
+        """直链视频文件？（m3u8 不算：那是播放列表文本，得交给 yt-dlp）"""
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+        except Exception:
+            path = (url or "").lower()
+        return any(path.endswith(ext) for ext in self._MEDIA_EXT)
+
+    def _ytdlp_exe(self) -> str:
+        cfg = str(self.cfg.get("yt_dlp") or "").strip()
+        if cfg and Path(cfg).exists():
+            return cfg
+        found = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+        if found:
+            return found
+        for cand in (
+            str(Path.home() / ".agent-reach-venv" / "Scripts" / "yt-dlp.exe"),
+            str(Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "yt-dlp" / "Scripts" / "yt-dlp.exe"),
+            str(Path.home() / "AppData" / "Local" / "Programs" / "Python" / "Scripts" / "yt-dlp.exe"),
+        ):
+            if Path(cand).exists():
+                return cand
+        return ""
+
+    def _ytdlp_fetch(self, url: str) -> str:
+        """yt-dlp 下前 N 秒，返回本地 mp4 路径；失败抛异常（细节只进日志）。"""
+        yt = self._ytdlp_exe()
+        if not yt:
+            raise RuntimeError("no-ytdlp")
+
+        secs = max(5, int(self.cfg.get("ytdlp_seconds", 30) or 30))
+        height = max(144, int(self.cfg.get("ytdlp_height", 480) or 480))
+        out = os.path.join(tempfile.gettempdir(), f"feiyu_video_{uuid.uuid4().hex}.mp4")
+        self._temporary_files.add(out)
+
+        fmt = f"worstvideo[height<={height}]/worstvideo/worst/bv*/b"
+        cmd = [yt, "--no-playlist", "--no-warnings", "--no-mtime", "--no-part",
+               "--socket-timeout", "15", "--retries", "2",
+               "-f", fmt, "--download-sections", f"*0-{secs}",
+               "--ffmpeg-location", self.ffmpeg, "-o", out, url]
+        cb = str(self.cfg.get("cookies_browser") or "").strip()
+        if cb:
+            cmd[1:1] = ["--cookies-from-browser", cb]
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"   # yt-dlp 是 Python 程序，别按 cp936 吐
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=120, env=env,
+                               creationflags=SUBPROCESS_FLAGS)
+        except subprocess.TimeoutExpired:
+            self._cleanup_download(out)
+            raise RuntimeError("timeout")
+
+        if p.returncode != 0 or not (os.path.exists(out) and os.path.getsize(out) > 0):
+            self._cleanup_download(out)
+            lines = [ln for ln in (p.stderr or p.stdout or "").splitlines() if ln.strip()]
+            raise RuntimeError("ytdlp-failed: " + (lines[-1][:200] if lines else str(p.returncode)))
+        return out
+
+    # bsk 的输出不保证是纯 JSON（前面可能有信息行），按花括号切片取
+    @staticmethod
+    def _json_slice(text: str) -> dict:
+        raw = (text or "").strip()
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        i, j = raw.find("{"), raw.rfind("}")
+        if 0 <= i < j:
+            try:
+                return json.loads(raw[i:j + 1])
+            except Exception:
+                return {}
+        return {}
+
+    def _bsk_grab(self, url: str) -> tuple[str, str, list[str]]:
+        """bsk 开页面，把 video 那块截几帧。返回 (标题, 简介, 帧路径)。"""
+        bsk_browser = str(self.cfg.get("bsk_browser") or "").strip()
+        args = ["session", "start", "--json", "--no-focus"]
+        if bsk_browser:
+            args += ["--browser", bsk_browser]
+        r = self._bsk(*args, timeout=90)
+        sid = str(self._json_slice(r.stdout).get("session_id") or "")
+        if not sid:
+            raise RuntimeError(f"bsk-session-failed: {(r.stderr or r.stdout)[:160]}")
+
+        shots: list[str] = []
+        try:
+            outdir = self.data_dir / "frames" / uuid.uuid4().hex[:8]
+            outdir.mkdir(parents=True, exist_ok=True)
+            self._bsk("navigate", url, "--session", sid, timeout=90)
+            time.sleep(max(1, int(self.cfg.get("browser_settle", 5) or 5)))
+
+            # 取播放器几何信息：先把元素滚到视口中间，再读 rect，
+            # 顺便把 dpr / scrollY 一起带回来，别在 Python 侧反推坐标系。
+            js = ("(()=>{const vs=[...document.querySelectorAll('video')]"
+                  ".filter(v=>v.offsetWidth>120&&v.offsetHeight>120);"
+                  "const v=vs.sort((a,b)=>b.offsetWidth*b.offsetHeight-a.offsetWidth*a.offsetHeight)[0];"
+                  "const m=document.querySelector('meta[name=description]');"
+                  "const d=m?m.content:'';"
+                  "if(!v) return JSON.stringify({ok:false,title:document.title,desc:d});"
+                  "try{v.scrollIntoView({block:'center'})}catch(e){};"
+                  "try{v.muted=true;v.pause()}catch(e){};"
+                  "const r=v.getBoundingClientRect();"
+                  "return JSON.stringify({ok:true,title:document.title,desc:d,"
+                  "x:r.x,y:r.y,w:r.width,h:r.height,iw:innerWidth,ih:innerHeight,"
+                  "dpr:devicePixelRatio,sy:scrollY,dur:v.duration||0})})()")
+            info = self._json_slice(self._bsk("evaluate", "--session", sid, "--json",
+                                              js, timeout=60).stdout)
+            try:
+                info = json.loads(info.get("value") or "{}") if "value" in info else info
+            except Exception:
+                info = {}
+            if not info.get("ok"):
+                raise RuntimeError("no-video-element")
+
+            n = max(1, int(self.cfg.get("browser_shots", 4) or 4))
+            dur = float(info.get("dur") or 0)
+            for i in range(n):
+                if dur > 0:
+                    t = max(0.3, min(dur - 0.2, dur * (i + 0.5) / n))
+                    self._bsk("evaluate", "--session", sid, "--json",
+                              "(()=>{const v=[...document.querySelectorAll('video')]"
+                              ".filter(v=>v.offsetWidth>120)[0];"
+                              f"if(v){{try{{v.currentTime={t:.2f}}}catch(e){{}}}};return 1}})()",
+                              timeout=30)
+                    time.sleep(0.9)
+                shot = outdir / f"b{i}.png"
+                self._bsk("screenshot", "--session", sid, "--out", str(shot), timeout=90)
+                if shot.exists() and shot.stat().st_size > 0:
+                    shots.append(str(self._crop_video_area(shot, info, outdir / f"c{i}.jpg")))
+        finally:
+            try:
+                self._bsk("session", "stop", sid, timeout=30)
+            except Exception as e:
+                logger.warning(f"[feiyu_video] bsk 会话没停掉 sid={sid}: {e}")
+        return str(info.get("title") or "")[:120], str(info.get("desc") or "")[:300], shots
+
+    def _crop_video_area(self, shot: str, info: dict, out: Path) -> str:
+        """按 video 元素 rect 裁出画面；算不准就整张用，宁可糙也别裁错。"""
+        try:
+            iw = float(info.get("iw") or 0)
+            ih = float(info.get("ih") or 0)
+            x, y = float(info.get("x") or 0), float(info.get("y") or 0)
+            w, h = float(info.get("w") or 0), float(info.get("h") or 0)
+            if iw <= 0 or ih <= 0 or w < 80 or h < 80:
+                return shot
+            # 只裁「元素 ∩ 视口」：抖音这种播放器比屏幕还高的，也能裁到中间那块
+            x0, y0 = max(0.0, min(x, iw)), max(0.0, min(y, ih))
+            x1, y1 = max(0.0, min(x + w, iw)), max(0.0, min(y + h, ih))
+            if (x1 - x0) < 160 or (y1 - y0) < 120:
+                logger.info("[feiyu_video] 播放器不在视口里，用整屏截图")
+                return shot
+            with Image.open(shot) as im:
+                scale = im.width / iw
+                box = (int(x0 * scale), int(y0 * scale),
+                       min(im.width, int(x1 * scale)), min(im.height, int(y1 * scale)))
+                if box[2] - box[0] < 120 or box[3] - box[1] < 90:
+                    return shot
+                crop = im.crop(box).convert("RGB")
+                crop.save(out, quality=90)
+            try:
+                Path(shot).unlink(missing_ok=True)   # 裁完的原图是纯中间产物
+            except OSError:
+                pass
+            return str(out)
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 裁画面失败: {e}")
+            return shot
+
+    async def _frames_from_url(self, url: str) -> tuple[list[str], str]:
+        """网页链接 → (帧列表, 附注文本)。先 yt-dlp，再退浏览器。"""
+        url = self._norm_url(url)
+        if not self._allowed(url):
+            raise PermissionError("url-not-allowed")
+
+        now = time.time()
+        hit = self._recent_links.get(url)
+        if hit and now - hit[0] < 60:
+            return hit[1], hit[2]
+
+        # 这些站不给 cookies 就不发流，白试一次还多等几秒——直接走浏览器
+        plat = self._platform(url)
+        needs_cookie = plat in ("douyin", "kuaishou", "xiaohongshu")
+        skip_ytdlp = needs_cookie and not str(self.cfg.get("cookies_browser") or "").strip()
+
+        async with self._video_sem:
+            try:
+                if skip_ytdlp:
+                    raise RuntimeError("needs-cookies")
+                path = await asyncio.to_thread(self._ytdlp_fetch, url)
+                frames = await asyncio.to_thread(self._frames, path)
+                if frames:
+                    logger.info(f"[feiyu_video] yt-dlp 拿到 {len(frames)} 帧: {url}")
+                    self._recent_links[url] = (now, frames, "")
+                    return frames, ""
+                logger.warning(f"[feiyu_video] yt-dlp 下到了但抽不出帧: {url}")
+            except Exception as e:
+                if "needs-cookies" not in str(e):
+                    logger.warning(f"[feiyu_video] yt-dlp 没拿到（{plat}）: {e}")
+
+            if not self.cfg.get("browser_fallback", True):
+                raise RuntimeError("no-fallback")
+
+            title, desc, shots = await asyncio.wait_for(
+                asyncio.to_thread(self._bsk_grab, url), timeout=180)
+            note = f"（下面这段是网页自己写的，不是用户的话）标题：{title}" if title else ""
+            if desc:
+                note += f"；简介：{desc[:200]}"
+            logger.info(f"[feiyu_video] 浏览器截帧 {len(shots)} 张: {url}")
+            self._recent_links[url] = (now, shots, note.strip())
+            return shots, note.strip()
+
+    @staticmethod
+    def _user_hint(e: Exception) -> str:
+        """给群里看的一句话；技术细节只进日志。"""
+        s = str(e)
+        if isinstance(e, PermissionError):
+            return "这个链接我不看，只认视频站的链接"
+        if "no-ytdlp" in s:
+            return "这条得先装 yt-dlp，我下不了"
+        if "timeout" in s:
+            return "这条下得太慢，先不看了"
+        if "cookie" in s.lower() or "登录" in s:
+            return "这个站要登录态，我拿不到画面"
+        if "bsk-session" in s:
+            return "浏览器没起来，等会儿再试"
+        if "no-video-element" in s:
+            return "页面打开了，但没找到视频画面"
+        if "no-fallback" in s:
+            return "这条下不下来，浏览器兜底又关着"
+        return "这条链接我打不开"
 
     def _duration(self, path: str) -> float:
         try:
@@ -145,11 +494,12 @@ class FeiyuVideo(Star):
     async def watch_video(self, event: AstrMessageEvent, video_ref: str, question: str = ""):
         """看一段视频：抽取关键画面，交给视觉模型，然后回答关于视频的问题。
 
-        什么时候用：用户发来视频、问"这个视频讲了什么"、让你看视频里的动作/场景/字幕、
-        或者要你评价视频内容时。
+        什么时候用：用户发来视频、**发来 B站/抖音/快手/小红书/YouTube 的页面链接**、
+        问"这个视频讲了什么"、让你看视频里的动作/场景/字幕，或者要你评价视频内容时。
+        页面链接直接传进来就行，插件会自己想办法把画面拿到。
 
         Args:
-            video_ref(string): 视频的本地路径，或 http(s) 链接
+            video_ref(string): 视频的本地路径，或 http(s) 链接（可以是 B站/抖音这类网页链接）
             question(string): 想从视频里知道什么；不填就概括视频内容
         """
         video_ref = (video_ref or "").strip().strip("'\"")
@@ -157,18 +507,25 @@ class FeiyuVideo(Star):
             yield event.plain_result("要我看哪个视频？")
             return
 
+        note = ""
+        frames: list[str] = []
         try:
-            path = video_ref
-            if video_ref.startswith(("http://", "https://")):
-                path = await asyncio.to_thread(self._download, video_ref)
-            if not os.path.exists(path):
-                yield event.plain_result(f"找不到视频文件：{path}")
-                return
-
-            frames = await asyncio.to_thread(self._frames, path)
+            video_ref = self._norm_url(video_ref)
+            is_link = video_ref.startswith(("http://", "https://"))
+            if is_link and not self._is_media_url(video_ref):
+                # B站/抖音这种网页：先 yt-dlp，再退浏览器截帧
+                frames, note = await self._frames_from_url(video_ref)
+            else:
+                path = video_ref
+                if is_link:
+                    path = await asyncio.to_thread(self._download, video_ref)
+                if not os.path.exists(path):
+                    yield event.plain_result(f"找不到视频文件：{path}")
+                    return
+                frames = await asyncio.to_thread(self._frames, path)
         except Exception as e:
-            logger.error(f"[feiyu_video] 处理视频失败: {e}")
-            yield event.plain_result(f"视频处理失败：{type(e).__name__}")
+            logger.exception(f"[feiyu_video] 处理视频失败: {video_ref}")
+            yield event.plain_result(self._user_hint(e))
             return
 
         if not frames:
@@ -177,7 +534,8 @@ class FeiyuVideo(Star):
 
         q = (question or "").strip() or "概括这段视频的内容：发生了什么、画面里有什么、氛围如何。"
         prompt = (
-            f"这些是从一段视频里按时间顺序抽取的 {len(frames)} 帧画面。\n"
+            (f"{note}\n" if note else "")
+            + f"这些是从一段视频里按时间顺序抽取的 {len(frames)} 帧画面。\n"
             f"用户的问题：{q}\n"
             "请只根据画面回答，具体、简要，不要编造画面里没有的东西。"
         )
@@ -310,22 +668,39 @@ class FeiyuVideo(Star):
         # 先像人一样应一声；用 send 直发，不会被别的插件截断
         await send("我看看…")
 
-        try:
-            path = ref
-            if ref.startswith(("http://", "https://")):
-                path = await asyncio.to_thread(self._download, ref)
-            if not os.path.exists(path):
-                # 只有文件名：找 NapCat 要真实地址
-                url = await self._fetch_video_url(event, os.path.basename(path))
-                if url:
-                    if url.startswith(("http://", "https://")):
-                        path = await asyncio.to_thread(self._download, url)
-                    else:
-                        path = url
-            if not os.path.exists(path):
-                await send(f"视频没拿到：{path}")
+        link_note = ""
+        ref = self._norm_url(ref) if ref else ref
+        if ref.startswith(("http://", "https://")) and not self._is_media_url(ref):
+            try:
+                frames, link_note = await self._frames_from_url(ref)
+            except Exception as e:
+                logger.exception(f"[feiyu_video] 链接视频失败: {ref}")
+                await send(self._user_hint(e))
                 return
-            frames = await asyncio.to_thread(self._frames, path)
+            if not frames:
+                await send("链接打开了，但没截到画面")
+                return
+            path = None
+        else:
+            frames = []
+            path = ref
+
+        try:
+            if path is not None:
+                if path.startswith(("http://", "https://")):
+                    path = await asyncio.to_thread(self._download, path)
+                if not os.path.exists(path):
+                    # 只有文件名：找 NapCat 要真实地址
+                    url = await self._fetch_video_url(event, os.path.basename(path))
+                    if url:
+                        if url.startswith(("http://", "https://")):
+                            path = await asyncio.to_thread(self._download, url)
+                        else:
+                            path = url
+                if not os.path.exists(path):
+                    await send(f"视频没拿到：{path}")
+                    return
+                frames = await asyncio.to_thread(self._frames, path)
         except Exception as e:
             logger.error(f"[feiyu_video] 处理视频失败: {e}")
             await send(f"视频打不开：{type(e).__name__}")
@@ -336,7 +711,8 @@ class FeiyuVideo(Star):
             return
 
         prompt = (
-            f"这些是从一段视频里按时间顺序抽取的 {len(frames)} 帧画面。请提取事实，严格输出 JSON，不要多余文字：\n"
+            (f"{link_note}\n" if link_note else "")
+            + f"这些是从一段视频里按时间顺序抽取的 {len(frames)} 帧画面。请提取事实，严格输出 JSON，不要多余文字：\n"
             '{"类型":"新闻/动漫/游戏/影视/生活/教学/其他",'
             '"主题":"一句话说这条视频在讲什么",'
             '"人物":["画面里出现的人，能认出来就写名字，认不出写身份描述"],'
@@ -701,7 +1077,7 @@ class FeiyuVideo(Star):
 
     @filter.command("看视频")
     async def cmd_watch(self, event: AstrMessageEvent):
-        """手动让她看视频：/看视频 <路径或链接>"""
+        """手动让她看视频：/看视频 <本地路径 或 B站/抖音链接>"""
         raw = (event.message_str or "").strip()
         parts = raw.split(maxsplit=1)
         if len(parts) < 2:
