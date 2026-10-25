@@ -1,0 +1,106 @@
+{
+  "_sec_vision": {
+    "description": "=== 看视频 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "vision_provider_id": {
+    "description": "视觉模型 provider id",
+    "type": "string",
+    "default": "",
+    "hint": "填 AstrBot 里配置好的多模态模型 id，例如 deepseek/deepseek-vision。"
+  },
+  "frames": {
+    "description": "抽帧数量",
+    "type": "int",
+    "default": 6,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    },
+    "hint": "越多越准，也越费钱/越慢。"
+  },
+  "max_seconds": {
+    "description": "最长视频时长（秒）",
+    "type": "int",
+    "default": 600,
+    "slider": {
+      "min": 10,
+      "max": 3600,
+      "step": 10
+    }
+  },
+  "frame_width": {
+    "description": "抽帧宽度（像素）",
+    "type": "int",
+    "default": 640,
+    "slider": {
+      "min": 320,
+      "max": 1920,
+      "step": 32
+    }
+  },
+  "_sec_rewrite": {
+    "description": "=== 说话方式 ===",
+    "type": "text",
+    "invisible": true
+  },
+  "rewrite": {
+    "description": "把事实重写成人格口吻",
+    "type": "bool",
+    "default": true
+  },
+  "rewrite_provider": {
+    "description": "重写用的文本模型 id",
+    "type": "string",
+    "default": "",
+    "condition": {
+      "rewrite": true
+    }
+  },
+  "history_turns": {
+    "description": "参考最近几轮对话",
+    "type": "int",
+    "default": 6,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 2
+    }
+  },
+  "_sec_search": {
+    "description": "=== 识图与联网（可选） ===",
+    "type": "text",
+    "invisible": true
+  },
+  "image_search": {
+    "description": "认不出时用百度识图",
+    "type": "bool",
+    "default": true,
+    "hint": "需要 bsk（browser-skill）可用。"
+  },
+  "bsk_path": {
+    "description": "bsk.exe 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空用 PATH 里的 bsk。不填且没装 bsk 时，识图会自动跳过。"
+  },
+  "bsk_browser": {
+    "description": "bsk 浏览器实例 id",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动获取并记住第一个实例。"
+  },
+  "search_key": {
+    "description": "搜索接口 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "留空则不联网补充。"
+  },
+  "search_api": {
+    "description": "搜索接口地址",
+    "type": "string",
+    "default": "https://api.deepseek.com/v1/tools/search"
+  }
+}
