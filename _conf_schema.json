@@ -206,17 +206,17 @@
   },
   "see_shots": {
     "type": "int",
-    "description": "一次给几帧",
-    "default": 3,
+    "description": "一次给几帧（按台词密度挑，不是等间隔）",
+    "default": 10,
     "slider": {
       "min": 1,
-      "max": 6,
+      "max": 30,
       "step": 1
     },
     "condition": {
       "see_with_llm": true
     },
-    "hint": "帧数越多信息越全，token 也越多；3 帧通常够看清在讲什么。"
+    "hint": "抽帧总数在「抽几帧」那项，两处要一起调大；帧多 token 也多。"
   },
   "see_cache_seconds": {
     "type": "int",
@@ -235,15 +235,43 @@
   "see_timeout": {
     "type": "int",
     "description": "一条链接最多等多久（秒）",
-    "default": 90,
+    "default": 420,
     "slider": {
       "min": 30,
-      "max": 300,
+      "max": 600,
       "step": 10
     },
     "condition": {
       "see_with_llm": true
     },
-    "hint": "超时就不带画面、直接回话，别让整条消息卡住。抖音这类走浏览器的一般 40 秒内。"
+    "hint": "整片下载 + 抽帧最坏要 5-6 分钟（一小时的片）；调太小会把已经拿到的台词一起丢掉。这一轮等不及就先给台词，画面下次再说。"
+  },
+  "long_sync_sec": {
+    "type": "int",
+    "description": "超过这个时长就只看前段（秒）",
+    "default": 3600,
+    "slider": {
+      "min": 300,
+      "max": 7200,
+      "step": 60
+    },
+    "hint": "太长的片整片下载会拖住这一轮回复。超过就只同步看前这么多秒，并且明确告诉她「后面还没看」，不许假装全片都看了。"
+  },
+  "subs_enable": {
+    "type": "bool",
+    "description": "读台词（B站 AI 字幕）",
+    "default": true,
+    "hint": "有字幕时她会拿到整段原话，按台词密度挑画面；没有就只给画面并如实说。"
+  },
+  "subs_inject_tokens": {
+    "type": "int",
+    "description": "台词最多念多少（token）",
+    "default": 6000,
+    "slider": {
+      "min": 1200,
+      "max": 20000,
+      "step": 200
+    },
+    "hint": "长片会按这个预算挑段，并在开头说明「这是节选」。"
   }
 }

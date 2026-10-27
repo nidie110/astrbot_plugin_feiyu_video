@@ -16,8 +16,40 @@ from pathlib import Path
 import sys as _sys
 
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-_sys.modules.pop("_feiyu_kit", None)  # 顶层模块名，重载插件时先清缓存再导，避免用到旧字节
-import _feiyu_kit as kit  # noqa: E402
+_KIT_PATH = Path(__file__).resolve().parent / "_feiyu_kit.py"
+kit = _sys.modules.get("_feiyu_kit")
+if kit is None:
+    # 全进程只有一份 kit：动作注册表必须共享，所以谁先加载谁就是那份，后来者直接复用。
+    # 磁盘上的 kit 改动要重启整个 AstrBot 进程才生效（面板重载插件不会换掉已经加载的模块）。
+    import importlib.util as _ilu  # noqa: PLC0415
+
+    _spec = _ilu.spec_from_file_location("_feiyu_kit", _KIT_PATH)
+    _fresh = _ilu.module_from_spec(_spec)
+    _sys.modules["_feiyu_kit"] = _fresh
+    _spec.loader.exec_module(_fresh)
+    kit = _fresh
+
+# ---- 看视频 v3 的纯函数层（字幕/选点/上下文）----
+# 用唯一包名按路径加载：persona_mind 也有一个叫 engine 的包，直接 import engine 会抢坑。
+_ENGINE_DIR = Path(__file__).resolve().parent / "engine"
+_ENGINE_PKG = "feiyu_video_engine"
+subs_mod = picks_mod = wctx_mod = None
+try:
+    if _ENGINE_PKG not in _sys.modules:
+        import importlib.util as _ilu2  # noqa: PLC0415
+
+        _espec = _ilu2.spec_from_file_location(
+            _ENGINE_PKG,
+            _ENGINE_DIR / "__init__.py",
+            submodule_search_locations=[str(_ENGINE_DIR)],
+        )
+        _emod = _ilu2.module_from_spec(_espec)
+        _sys.modules[_ENGINE_PKG] = _emod
+        _espec.loader.exec_module(_emod)
+    _engine = _sys.modules[_ENGINE_PKG]
+    subs_mod, picks_mod, wctx_mod = _engine.subs, _engine.picks, _engine.watchctx
+except Exception as _ex:  # 纯函数层坏了不能让整个插件起不来
+    print(f"[feiyu_video] engine 加载失败（字幕功能会关闭）: {_ex}")
 
 import imageio_ffmpeg
 from PIL import Image
@@ -43,6 +75,49 @@ _STYLE_RULES = """你在跟朋友聊天，刚看完他甩来的东西。写一�
 - 不许 Markdown、书名号堆叠、分点、标题、堆感叹号
 - 认不出是谁/哪部作品就直说认不出，别编
 - 如果对方问了具体问题：先用不超过 20 字答那个问题，再补一句你的看法"""
+
+
+# B 站页面里一次读完：aid / cid / 时长 / 标题 / 字幕列表。
+# `_t` 破缓存是必需的：不加会命中 CDN 缓存，拿到上一个视频的字幕（实测覆盖时长超过本片）。
+_BILI_PROBE_JS = r"""(async () => {
+  const st = window.__INITIAL_STATE__ || {};
+  const v = st.videoData || {};
+  const pages = Array.isArray(v.pages) ? v.pages : [];
+  let p = 1;
+  try { p = parseInt(new URLSearchParams(location.search).get('p') || '1', 10) || 1; } catch (e) {}
+  const page = pages[p - 1] || pages[0] || {};
+  const aid = v.aid || 0;
+  const cid = page.cid || v.cid || 0;
+  const out = {
+    ok: !!(aid && cid), aid: aid, cid: cid, bvid: v.bvid || '',
+    dur: Math.round(page.duration || v.duration || 0),
+    title: String(v.title || document.title || '').slice(0, 120),
+    desc: String(v.desc || '').slice(0, 300),
+    page: p, n_pages: pages.length, subs: []
+  };
+  if (!out.ok) return JSON.stringify(out);
+  try {
+    const t = Date.now();
+    const r = await fetch('//api.bilibili.com/x/player/v2?aid=' + aid + '&cid=' + cid + '&_t=' + t,
+                          { credentials: 'include' });
+    const j = await r.json();
+    const list = (((j || {}).data || {}).subtitle || {}).subtitles || [];
+    out.subs = list.map(x => ({ lan: x.lan, lan_doc: x.lan_doc, url: x.subtitle_url, ai: x.ai_status }));
+    out.code = (j || {}).code;
+  } catch (e) {
+    out.subs_err = String((e && e.message) || e).slice(0, 120);
+  }
+  return JSON.stringify(out);
+})()"""
+
+
+_BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
+
+
+def _bvid_of(url: str) -> str:
+    """链接里的 BV 号（b23 短链取不到就返回空）。"""
+    m2 = _BV_RE.search(str(url or ""))
+    return m2.group(1) if m2 else ""
 
 
 def _facts_prompt(note: str, n_frames: int) -> str:
@@ -121,10 +196,23 @@ DEFAULT_CONFIG = {
     "browser_settle": 5,
     # ---- 让她自己看：帧直接进主模型的请求，我不替她转述 ----
     "see_with_llm": True,
-    "see_shots": 3,
+    "see_shots": 10,
+    "see_shots_max": 12,  # 钩子里注入画面的硬上限（再多 token 撑不住）
     "see_cache_seconds": 600,
     # 一条链接最多等多久（秒）；超时就不带帧，别把整条消息卡死
-    "see_timeout": 90,
+    "see_timeout": 420,
+    # 超过这个时长就只同步看前 long_sync_sec 秒（1 小时的片下载约 2 分钟，再长就撑不住一轮回复）
+    "long_sync_sec": 3600,
+    # ---- 字幕（v3）----
+    # 要不要连字幕一起给她。关掉就退化成「只看画面」的老行为。
+    "subs_enable": True,
+    # 当轮注入的字幕 token 上限（中文 1 字≈0.6 token，6000 约等于一万字）
+    "subs_inject_tokens": 6000,
+    # 覆盖率低于这个就当「残缺」，要么降级要么标注
+    "cover_min_ratio": 0.85,
+    "cover_max_gap_sec": 60,
+    # 时间戳：off = 上下文里完全没有；on_demand = 她明确问时才给单点
+    "time_marks": "off",
 }
 
 
@@ -133,6 +221,9 @@ class FeiyuVideo(Star):
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
+        kit.register_capability("feiyu_video", "能看视频，自己抽几帧出来看画面，看完用我自己的话说", "all")
+        kit.register_action("看视频", self.do_watch, "看视频/网页链接的画面，参数 video_ref、question")
+        kit.register_action("认人", self._identify_last, "对刚看的画面以图搜图认人")
         self.data_dir = Path("data/plugin_data") / PLUGIN_NAME
         self._last_frames: dict[str, list] = {}
         self._temporary_files: set[str] = set()
@@ -209,7 +300,8 @@ class FeiyuVideo(Star):
         return out
 
     def _cleanup_download(self, path: str) -> None:
-        if path not in self._temporary_files:
+        temp = getattr(self, "_temporary_files", None)
+        if temp is None or path not in temp:
             return
         try:
             Path(path).unlink(missing_ok=True)
@@ -293,8 +385,13 @@ class FeiyuVideo(Star):
     def _ytdlp_exe(self) -> str:
         return kit.find_ytdlp(str(self.cfg.get("yt_dlp") or ""))
 
-    def _ytdlp_fetch(self, url: str) -> str:
-        """yt-dlp 下前 N 秒，返回本地 mp4 路径；失败抛异常（细节只进日志）。"""
+    def _ytdlp_fetch(self, url: str, full: bool = False, max_sec: int = 0) -> str:
+        """yt-dlp 下载，返回本地 mp4 路径；失败抛异常（细节只进日志）。
+
+        full=False 只下前 ytdlp_seconds 秒（预览，快）；full=True 下整片。
+        整片才够按字幕密度选点 —— 只下前 30 秒的话后半段一帧都没有。
+        max_sec>0 时即使 full=True 也只下前 max_sec 秒（长片兜底）。
+        """
         yt = self._ytdlp_exe()
         if not yt:
             raise RuntimeError("no-ytdlp")
@@ -307,17 +404,22 @@ class FeiyuVideo(Star):
         fmt = f"worstvideo[height<={height}]/worstvideo/worst/bv*/b"
         cmd = [yt, "--no-playlist", "--no-warnings", "--no-mtime", "--no-part",
                "--socket-timeout", "15", "--retries", "2",
-               "-f", fmt, "--download-sections", f"*0-{secs}",
-               "--ffmpeg-location", self.ffmpeg, "-o", out, url]
+               "-f", fmt]
+        if not full or max_sec > 0:
+            # 注意：--download-sections 需要 ffmpeg；整片下载不需要（别顺手带上）
+            seg = int(max_sec) if max_sec > 0 else secs
+            cmd += ["--download-sections", f"*0-{seg}", "--ffmpeg-location", self.ffmpeg]
+        cmd += ["-o", out, url]
         cb = str(self.cfg.get("cookies_browser") or "").strip()
         if cb:
             cmd[1:1] = ["--cookies-from-browser", cb]
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"   # yt-dlp 是 Python 程序，别按 cp936 吐
+        limit = 300 if (full or max_sec > 0) else 120
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=120, env=env,
+                               errors="replace", timeout=limit, env=env,
                                creationflags=SUBPROCESS_FLAGS)
         except subprocess.TimeoutExpired:
             self._cleanup_download(out)
@@ -328,6 +430,37 @@ class FeiyuVideo(Star):
             lines = [ln for ln in (p.stderr or p.stdout or "").splitlines() if ln.strip()]
             raise RuntimeError("ytdlp-failed: " + (lines[-1][:200] if lines else str(p.returncode)))
         return out
+
+    def _ytdlp_meta(self, url: str) -> dict:
+        """只问元数据（时长/标题），不下载。给「先决定要不要截断」用，秒级返回。"""
+        yt = self._ytdlp_exe()
+        if not yt:
+            return {}
+        cmd = [yt, "--no-playlist", "--no-warnings", "--skip-download",
+               "--print", "%(duration)s|%(title)s", "--", url]
+        cb = str(self.cfg.get("cookies_browser") or "").strip()
+        if cb:
+            cmd[1:1] = ["--cookies-from-browser", cb]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=45, env=env,
+                               creationflags=SUBPROCESS_FLAGS)
+        except Exception as e:
+            logger.info(f"[feiyu_video] 取时长超时/失败 {url[:60]}: {e}")
+            return {}
+        if p.returncode != 0:
+            return {}
+        rows = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
+        if not rows:
+            return {}
+        dur_s, _, title = rows[-1].partition("|")
+        try:
+            dur = float(dur_s)
+        except Exception:
+            dur = 0.0
+        return {"dur": dur, "title": title}
 
     # bsk 的输出不保证是纯 JSON（前面可能有信息行），按花括号切片取
     @staticmethod
@@ -407,6 +540,454 @@ class FeiyuVideo(Star):
             except Exception as e:
                 logger.warning(f"[feiyu_video] bsk 会话没停掉 sid={sid}: {e}")
         return str(info.get("title") or "")[:120], str(info.get("desc") or "")[:300], shots
+
+    def _subs_text(self, ctx) -> str:
+        """把字幕排版成自然段引文；超预算就均匀抽段并声明是节选。"""
+        if subs_mod is None or ctx is None or not ctx.subs or not ctx.subs.cues:
+            return ""
+        try:
+            tokens = max(600, int(self.cfg.get("subs_inject_tokens") or 6000))
+            max_chars = int(tokens / 0.62)  # 中文约 0.62 token/字
+            segs = subs_mod.segment(ctx.subs.cues)
+            total = sum(x.chars for x in segs)
+            long = "long" in (getattr(ctx, "errors", None) or [])
+            declared = "part" if (total > max_chars or long) else "full"
+            return subs_mod.render(ctx.subs, segs, declared=declared, max_chars=max_chars)
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 字幕排版失败: {e}")
+            return ""
+
+    def _inject_temp(self, req, text: str) -> bool:
+        """只对这一轮有效的动态内容：字幕、提示语都走这里。
+
+        **绝不写 system_prompt** —— 那是会话前缀，每轮变一次就把前缀缓存全废掉，
+        而且这些内容只对当前这一轮有意义。框架没有 TextPart 时宁可不注入并记日志，
+        也不退回 system_prompt。
+        """
+        if not text:
+            return False
+        try:
+            from astrbot.core.agent.message import TextPart
+        except Exception:
+            logger.warning(
+                "[feiyu_video] 这个 AstrBot 版本没有 TextPart，本轮动态内容跳过（不写 system_prompt）"
+            )
+            return False
+        try:
+            if not isinstance(req.extra_user_content_parts, list):
+                req.extra_user_content_parts = []
+            part = TextPart(text=text)
+            try:
+                part.mark_as_temp()
+            except Exception:
+                try:
+                    part._no_save = True
+                except Exception:
+                    pass
+            req.extra_user_content_parts.append(part)
+            return True
+        except Exception as e:  # 注入失败不能把这一轮带崩
+            logger.warning(f"[feiyu_video] 临时内容注入失败（这一轮跳过）: {e}")
+            return False
+
+    def _watch_hint(self, ctx, *, handed: int, can_image: bool) -> str:
+        has_subs = bool(ctx is not None and ctx.subs and ctx.subs.cues)
+        has_frames = bool(ctx is not None and ctx.frames) and can_image
+        if has_subs and has_frames:
+            body = ("他发来的是视频链接。下面那段是他们说过的话（原话，一句句都在），"
+                    "上面几张是从里面挑出来的画面，两样你都能用。")
+        elif has_subs:
+            body = ("他发来的是视频链接。下面那段是他们说过的话（原话，一句句都在）——"
+                    "但这次画面没跟上，你没看见人在干什么。")
+        elif has_frames:
+            body = ("他发来的是视频链接。上面几张是从里面挑出来的画面，你能看到；"
+                    "这次没拿到他们说的话，别替他们编台词。")
+        else:
+            body = "他发来的是视频链接，但这次两样都没取到。直说没看成，别猜。"
+        long_note = self._long_note(ctx)
+        if long_note:
+            body = body + long_note
+        return (
+            "\n\n（" + body
+            + "用你自己的口气回他，别用「视频里展示了…」这种播报腔，也别复述字段名。"
+            "他们说过的词就照着说，画面你没看到的地方别补。"
+            "别念时间点，也别说你是怎么拿到这些的。）"
+        )
+
+    def _watch_result(self, ctx) -> str:
+        """tool 路径：把已经取到的东西交回给她（hook 那轮已经注入过的不重复）。"""
+        if ctx is None:
+            return "这次没取到东西。直说没看成。"
+        parts: list[str] = []
+        text = self._subs_text(ctx)
+        if text:
+            parts.append(text)
+        if ctx.frames and "hook" in str(getattr(ctx, "how", "")):
+            parts.append(f"（这一轮你手上有 {len(ctx.frames)} 张画面，就在上面。）")
+        if not parts:
+            if wctx_mod is not None:
+                return wctx_mod.describe_phase(ctx.phase)
+            return "这次没取到东西。直说没看成。"
+        long_note = self._long_note(ctx)
+        if long_note:
+            parts.append(long_note)
+        parts.append("用你自己的口气回他，别复述字段名，别念时间点。")
+        return "\n\n".join(parts)
+
+    # ---------- 字幕（v3）----------
+
+    def _bili_probe(self, url: str) -> tuple[dict, list]:
+        """开一次 B 站页面，读 aid/cid/时长 + 字幕列表。返回 (meta, subtitles)。
+
+        只开一次、只读不点：后面下载走 yt-dlp，所以这里不截帧。
+        """
+        if self._platform(url) != "bilibili":
+            return {}, []
+        bsk_browser = str(self.cfg.get("bsk_browser") or "").strip()
+        args = ["session", "start", "--json", "--no-focus"]
+        if bsk_browser:
+            args += ["--browser", bsk_browser]
+        r = self._bsk(*args, timeout=90)
+        sid = str(self._json_slice(r.stdout).get("session_id") or "")
+        if not sid:
+            raise RuntimeError(f"bsk-session-failed: {(r.stderr or r.stdout)[:160]}")
+        info: dict = {}
+        try:
+            self._bsk("navigate", url, "--session", sid, timeout=90)
+            time.sleep(max(2, int(self.cfg.get("browser_settle", 5) or 5)))
+            raw = self._bsk("evaluate", "--session", sid, "--json", _BILI_PROBE_JS, timeout=90).stdout
+            info = self._json_slice(raw)
+            try:
+                info = json.loads(info.get("value") or "{}") if "value" in info else info
+            except Exception:
+                info = {}
+            # 页面刚打开时 x/player/v2 偶尔只回一条默认字幕（登录态还没挂上 / 接口慢），
+            # 隔两秒再问一次通常就齐了（实测同一视频 5 秒时 1 条、6 秒时 6 条）。
+            for _ in range(2):
+                if len(info.get("subs") or []) > 1 or not info.get("ok"):
+                    break
+                time.sleep(2)
+                try:
+                    raw2 = self._bsk(
+                        "evaluate", "--session", sid, "--json", _BILI_PROBE_JS, timeout=90
+                    ).stdout
+                    nxt = self._json_slice(raw2)
+                    nxt = json.loads(nxt.get("value") or "{}") if "value" in nxt else nxt
+                except Exception as e:
+                    logger.info(f"[feiyu_video] 字幕重试失败（不影响画面）: {e}")
+                    break
+                if nxt.get("ok"):
+                    info = nxt
+                    if len(info.get("subs") or []) > 1:
+                        logger.info("[feiyu_video] 字幕列表重试后有内容了")
+                        break
+        finally:
+            try:
+                self._bsk("session", "stop", sid, timeout=30)
+            except Exception as e:
+                logger.warning(f"[feiyu_video] probe 会话没停掉 sid={sid}: {e}")
+        if not info.get("ok"):
+            logger.info(f"[feiyu_video] 页面上拿不到 aid/cid: {info.get('subs_err') or info}")
+            return {}, []
+        want = _bvid_of(url)
+        got = str(info.get("bvid") or "").strip()
+        if want and got and want != got:
+            # bsk 复用了旧标签页：页面还是上一条视频。宁可当作没有字幕，也不能张冠李戴。
+            logger.warning(f"[feiyu_video] 页面是别的视频（要 {want}，页面 {got}），这次不算")
+            return {}, []
+        meta = {k: info.get(k) for k in ("aid", "cid", "bvid", "dur", "title", "desc", "page", "n_pages")}
+        subs = info.get("subs") or []
+        logger.info(
+            f"[feiyu_video] 页面信息 aid={meta.get('aid')} cid={meta.get('cid')} "
+            f"dur={meta.get('dur')}s subs={len(subs)}"
+        )
+        return meta, subs
+
+    def _subs_doc(self, meta: dict, subs: list):
+        """挑一条字幕并拉正文。不需要 cookie（auth_key 已在 URL 里），只要 Referer。"""
+        if subs_mod is None or not subs:
+            return None
+        pick = subs_mod.pick_doc(subs)
+        if not pick:
+            return None
+        url = str(pick.get("subtitle_url") or pick.get("url") or "")
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url.startswith("http"):
+            return None
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Referer": "https://www.bilibili.com/",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                    ),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 字幕正文拉取失败: {e}")
+            return None
+        data = body
+        if body.lstrip().startswith("{"):
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = body
+        cues = subs_mod.parse_any(data, fmt=str(pick.get("lan") or ""))
+        cues = subs_mod.punctuate(subs_mod.clean_cues(cues))
+        doc = subs_mod.SubsDoc(
+            cues=cues,
+            dur=float(meta.get("dur") or 0),
+            lang=str(pick.get("lan") or ""),
+            source="ai" if "ai" in str(pick.get("lan") or "") else "manual",
+            raw_chars=len(body),
+        )
+        cov = doc.cover
+        logger.info(
+            f"[feiyu_video] 字幕 {len(doc.cues)} 条 / {doc.chars} 字 · "
+            f"覆盖率 {cov.ratio:.2f} · 空洞 {cov.max_gap:.0f}s"
+        )
+        return doc
+
+    def _download_full(self, url: str, max_sec: int = 0) -> tuple[str, float]:
+        """整片（或前 max_sec 秒）下到本地，返回 (路径, 时长)。失败抛异常。
+
+        单独拆出来是为了让它能跟「探测 + 取字幕」并行跑 ——
+        串行时最坏 60(探测) + 25(字幕) + 330(下载抽帧) = 415 秒，90 秒配置下功能直接不可用。
+        """
+        path = self._ytdlp_fetch(url, full=True, max_sec=max_sec)
+        dur = self._duration(path)
+        if dur <= 0 and max_sec > 0:
+            dur = float(max_sec)
+        return path, dur
+
+    def _pick_frames(self, path: str, dur: float, doc, n: int = 0) -> tuple[list, list]:
+        """按台词密度选点并定点抽帧。返回 (帧, 选点)。
+
+        字幕**不完整**（覆盖率不够、中间断层、只到前四分之一）时不能按密度抽：
+        残缺字幕会把所有帧都吸到有字幕的那一段，后半段一帧都没有。这种情况退回等间隔。
+        """
+        n = n or self._shot_count()
+        # 长片只下了前段：字幕还是全片的，超出行长的那几条不能进选点，
+        # 否则 _bucket 会把它们全塞进末桶、_extract_at 抽空帧（静默少帧）。
+        cues = [c for c in (doc.cues if doc is not None else []) if c.mid <= dur + 1.0]
+        if doc is not None and doc.cover.ok and cues:
+            spots = picks_mod.plan(cues, dur, n=n)
+            how = "按台词密度选点"
+        else:
+            spots = picks_mod.even_spots(dur, n)
+            how = "等间隔"
+            if doc is not None:
+                logger.info(f"[feiyu_video] 字幕不完整（{doc.cover.reason()}），抽帧退回等间隔")
+        frames = self._extract_at(path, [sp.t for sp in spots])
+        logger.info(f"[feiyu_video] {how} {picks_mod.describe(spots)} · 片子 {dur:.0f}s")
+        return frames, spots
+
+    def _frames_by_plan(self, url: str, meta: dict, doc, *, max_sec: int = 0) -> tuple[list[str], float, list]:
+        """下整片 → 选点 → 定点抽帧（串行版外壳）。失败返回 ([], 0, [])。
+
+        现在 _watch_gather 走的是并行版（_download_full + _pick_frames）；
+        这里留着是为了外部调用方和单测不炸。
+        """
+        path = ""
+        try:
+            path, dur = self._download_full(url, max_sec=max_sec)
+            if dur <= 0:
+                dur = float(meta.get("dur") or 0)
+                if max_sec > 0:
+                    dur = min(dur, float(max_sec))
+            frames, spots = self._pick_frames(path, dur, doc)
+            return frames, dur, spots
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 整片抽帧失败 {url[:80]}: {e}")
+            return [], 0.0, []
+        finally:
+            if path:
+                self._cleanup_download(path)
+
+    def _watch_cache_get(self, ref: str):
+        """同一条视频在 see_cache_seconds 内复用上一轮的 ctx。
+
+        hook 会在**每次工具调用后的续跑**再触发一次，没有这层缓存的话，
+        她追问一句「第二个人说啥」就要再等一整轮下载。
+        """
+        import time as _time
+
+        cache = self.__dict__.setdefault("_watch_cache", {})
+        hit = cache.get(ref)
+        if not hit:
+            return None
+        ts, ctx = hit
+        if _time.time() - ts > max(30, int(self.cfg.get("see_cache_seconds") or 600)):
+            cache.pop(ref, None)
+            return None
+        return ctx
+
+    def _watch_cache_put(self, ref: str, ctx) -> None:
+        import time as _time
+
+        cache = self.__dict__.setdefault("_watch_cache", {})
+        cache[ref] = (_time.time(), ctx)
+        if len(cache) > 40:
+            for k in sorted(cache, key=lambda x: cache[x][0])[:15]:
+                cache.pop(k, None)
+
+    def _long_note(self, ctx) -> str:
+        """长片只看了前段时的那句实话；没截断就返回空串。"""
+        if ctx is None or "long" not in (getattr(ctx, "errors", None) or []):
+            return ""
+        cap = max(120, int(self.cfg.get("long_sync_sec") or 3600))
+        mins = max(1, int(round(cap / 60)))
+        return (
+            f"这条片子太长，画面只看了前 {mins} 分钟——后面的台词你手上有、画面没有。"
+            f"他要是问后半段的东西，就说画面没跟到那儿，别替他补。"
+        )
+
+    def _shot_count(self) -> int:
+        """这一轮给几张画面：配置值，但卡在硬上限内。"""
+        cap = int(DEFAULT_CONFIG.get("see_shots_max") or 12)
+        try:
+            want = int(self.cfg.get("see_shots") or DEFAULT_CONFIG.get("see_shots") or 10)
+        except Exception:
+            want = 10
+        return max(1, min(cap, want))
+
+    async def _subs_chain(self, url: str, ctx):
+        """字幕那条链：取页面信息 → 取字幕正文。失败只记错误，不抛。"""
+        meta: dict = {}
+        try:
+            meta, subs_list = await asyncio.wait_for(
+                asyncio.to_thread(self._bili_probe, url), timeout=60
+            )
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 取页面信息失败 {url[:80]}: {e}")
+            ctx.add_error("probe")
+            return meta, None
+        if meta:
+            ctx.dur = float(meta.get("dur") or 0)
+        if not subs_list:
+            return meta, None
+        try:
+            doc = await asyncio.wait_for(
+                asyncio.to_thread(self._subs_doc, meta, subs_list), timeout=25
+            )
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 字幕处理失败: {e}")
+            ctx.add_error("subs")
+            return meta, None
+        if doc is None:
+            ctx.add_error("subs")
+            return meta, None
+        ctx.subs = doc
+        for w in subs_mod.self_check(doc):
+            logger.info(f"[feiyu_video] 字幕可疑：{w}")
+        return meta, doc
+
+    async def _picture_chain(self, url: str, ctx):
+        """画面那条链：先问时长 → 决定要不要截断 → 下整片。返回 (路径, 时长)。
+
+        这条链**不依赖字幕**，所以能和字幕链同时跑：总耗时从「三段相加」变成「取较慢的一条」。
+        时长用 yt-dlp 的元数据问（秒级），不为它去等 bsk 探测那 20-60 秒。
+        """
+        total = 0.0
+        try:
+            quick = await asyncio.wait_for(asyncio.to_thread(self._ytdlp_meta, url), timeout=45)
+            total = float(quick.get("dur") or 0)
+        except Exception as e:
+            logger.info(f"[feiyu_video] 取时长失败（不影响下载）{url[:60]}: {e}")
+        cap = max(120, int(self.cfg.get("long_sync_sec") or 3600))
+        max_sec = 0
+        if total > cap:
+            max_sec = cap
+            ctx.add_error("long")
+            logger.info(
+                f"[feiyu_video] 片子 {total:.0f}s 超过 {cap}s，这一轮只看前 {cap}s"
+                f"（后面的等主人问起来再说，不假装全片都看了）"
+            )
+        try:
+            async with self._video_sem:
+                path, dur = await asyncio.wait_for(
+                    asyncio.to_thread(self._download_full, url, max_sec), timeout=360
+                )
+            return path, (dur if dur > 0 else total)
+        except asyncio.TimeoutError:
+            logger.warning(f"[feiyu_video] 下载超时 {url[:80]}")
+            ctx.add_error("frames-timeout")
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 下载失败 {url[:80]}: {e}")
+            ctx.add_error("frames")
+        return "", 0.0
+
+    async def _watch_gather(self, ref: str, *, how: str = "tool", ctx=None):
+        """一次观看的全部产物：字幕 + 帧。hook 与 tool 共用同一份。
+
+        失败一律降级（不抛）：拿不到字幕就只要画面，拿不到画面就只要字幕。
+        **ctx 可以由调用方先建好传进来** —— 外面用 wait_for 包着的时候，
+        超时会把整个协程取消掉，只有 ctx 在调用方手里，已经读到的东西才留得下来。
+
+        两条链并行：字幕（bsk 探测 + 取正文）与画面（问时长 + 下整片）互不等待，
+        都到齐了才做「按台词选点 + 抽帧」—— 那一步是本地 ffmpeg，十几秒。
+        """
+        if wctx_mod is None:
+            return None
+        if ctx is None:
+            ctx = wctx_mod.WatchContext(ref=ref, how=how)
+        url = ref if str(ref).startswith(("http://", "https://")) else ""
+
+        if not (url and self._platform(url) == "bilibili" and self.cfg.get("subs_enable", True)):
+            try:
+                frames, note = await self._frames_for_llm(ref)
+                ctx.frames = frames
+                if note:
+                    logger.info(f"[feiyu_video] 页面自带说明（不进上下文）: {note[:80]}")
+                if not frames:
+                    ctx.add_error("frames")
+            except Exception as e:
+                logger.warning(f"[feiyu_video] 取画面失败 {url[:80]}: {e}")
+                ctx.add_error("frames")
+            logger.info(f"[feiyu_video] 观看结果 {ctx.brief()}")
+            return ctx
+
+        subs_task = asyncio.create_task(self._subs_chain(url, ctx))
+        pic_task = asyncio.create_task(self._picture_chain(url, ctx))
+        results = await asyncio.gather(subs_task, pic_task, return_exceptions=True)
+
+        meta, doc = {}, None
+        if isinstance(results[0], tuple):
+            meta, doc = results[0]
+        elif results[0] is not None:
+            logger.warning(f"[feiyu_video] 字幕链异常: {results[0]}")
+        path, dur = "", 0.0
+        if isinstance(results[1], tuple):
+            path, dur = results[1]
+        elif results[1] is not None:
+            logger.warning(f"[feiyu_video] 画面链异常: {results[1]}")
+
+        if dur > 0:
+            ctx.dur = dur
+        elif meta.get("dur"):
+            ctx.dur = float(meta.get("dur") or 0)
+
+        try:
+            if path and dur > 0 and picks_mod is not None:
+                frames, spots = await asyncio.to_thread(self._pick_frames, path, dur, ctx.subs)
+                ctx.frames = frames
+                ctx.plan = spots
+        except Exception as e:
+            logger.warning(f"[feiyu_video] 抽帧失败 {url[:80]}: {e}")
+            ctx.add_error("frames")
+        finally:
+            if path:
+                self._cleanup_download(path)
+
+        if not ctx.frames:
+            ctx.add_error("frames")
+        logger.info(f"[feiyu_video] 观看结果 {ctx.brief()}")
+        return ctx
 
     # ---------- 说话的口气 ----------
 
@@ -595,6 +1176,8 @@ class FeiyuVideo(Star):
 
     def _link_in_message(self, msg: str) -> str | None:
         for raw in re.findall(r"https?://[^\s<>【】（）「」]+", msg or ""):
+            # 中文常常紧贴着链接写（"…&vd_source=xxx给你看看这个"），在第一个汉字处切断
+            raw = re.split(r"[\u4e00-\u9fa5]", raw, maxsplit=1)[0]
             url = self._norm_url(raw.rstrip("，。！？；：、,.!?"))
             if self._allowed(url):
                 return url
@@ -633,61 +1216,85 @@ class FeiyuVideo(Star):
 
     @filter.on_llm_request()
     async def see_frames_with_llm(self, event: AstrMessageEvent, req) -> None:
-        """他要她看看这条视频：把抽出来的帧塞进这一次请求，让她自己看、自己说。"""
+        """他发来视频/链接：把台词和画面一起塞进这一次请求，让她自己看、自己说。"""
         if not self.cfg.get("see_with_llm", True):
             return
         msg = (event.message_str or "").strip()
         if msg.startswith("/"):
             return
-        if not self._main_supports_image(event):
-            return
         # 只发视频（QQ 里 message_str 是空串）走组件；只发链接走文本
         ref = self._video_ref(event) or self._link_in_message(msg)
         if not ref:
             return
-        try:
-            frames, note = await asyncio.wait_for(
-                self._frames_for_llm(ref),
-                timeout=float(self.cfg.get("see_timeout") or 90),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"[feiyu_video] 自己看：取帧超时 {ref[:80]}")
+        # B3：同一条视频短时间内反复出现（hook 会在每次工具调用后的续跑再触发），
+        # 直接复用上一轮的产物，不重新下载。
+        ctx = self._watch_cache_get(ref)
+        if ctx is None:
+            if wctx_mod is None:
+                return
+            # B1：ctx 必须在 wait_for 外面建。超时会把整个协程取消掉，
+            # ctx 只有在我们手上，已经读到的字幕才不会跟着一起没。
+            ctx = wctx_mod.WatchContext(ref=ref, how="hook")
+            budget = max(float(self.cfg.get("see_timeout") or 420), 480.0)
+            try:
+                await asyncio.wait_for(
+                    self._watch_gather(ref, how="hook", ctx=ctx), timeout=budget
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[feiyu_video] 自己看：超过 {budget:.0f}s，用已经拿到的部分 {ref[:80]}"
+                )
+            except Exception as e:
+                logger.warning(f"[feiyu_video] 自己看：失败 {ref[:80]}: {e}")
+            self._watch_cache_put(ref, ctx)
+            if not ctx.subs and not ctx.frames:
+                return
+
+        can_image = self._main_supports_image(event)
+        handed = 0
+        if can_image and ctx.frames:
+            picked = list(ctx.frames)[: self._shot_count()]
+            # 只给这一轮看：_no_save 让框架别把这几张图写进会话历史、别每轮重发
+            try:
+                from astrbot.core.agent.message import ImageURLPart
+            except Exception:  # 老版本没有这个类，退回老写法
+                ImageURLPart = None
+            if ImageURLPart is not None:
+                if not isinstance(req.extra_user_content_parts, list):
+                    req.extra_user_content_parts = []
+                for p in picked:
+                    part = ImageURLPart(image_url=ImageURLPart.ImageURL(url=p))
+                    try:
+                        part._no_save = True
+                    except Exception:
+                        pass
+                    req.extra_user_content_parts.append(part)
+            else:
+                req.image_urls = list(req.image_urls or []) + picked
+            self._last_frames[event.unified_msg_origin] = picked
+            handed += 1
+
+        text = self._subs_text(ctx)
+        if text and self._inject_temp(req, text):
+            handed += 1
+
+        if not handed:
+            logger.info(f"[feiyu_video] 这次什么都没取到 · {ctx.brief()} · {ref[:80]}")
             return
-        except Exception as e:
-            logger.warning(f"[feiyu_video] 自己看：取帧失败 {ref[:80]}: {e}")
-            return
-        if not frames:
-            return
-        picked = list(frames)[: max(1, int(self.cfg.get("see_shots") or 3))]
-        # 只给这一轮看：_no_save 让框架别把这几张图写进会话历史、别每轮重发
+        hint = self._watch_hint(ctx, handed=handed, can_image=can_image)
+        if not self._inject_temp(req, hint):
+            logger.info("[feiyu_video] 提示语没注进去（没有临时通道），这轮只有原始内容")
         try:
-            from astrbot.core.agent.message import ImageURLPart
-        except Exception:  # 老版本没有这个类，退回老写法
-            ImageURLPart = None
-        if ImageURLPart is not None:
-            if not isinstance(req.extra_user_content_parts, list):
-                req.extra_user_content_parts = []
-            for p in picked:
-                part = ImageURLPart(image_url=ImageURLPart.ImageURL(url=p))
-                try:
-                    part._no_save = True
-                except Exception:
-                    pass
-                req.extra_user_content_parts.append(part)
-        else:
-            req.image_urls = list(req.image_urls or []) + picked
-        hint = ("\n\n（他发来的是视频/视频链接，上面那几张就是从里面按时间顺序截的画面，你能直接看到。"
-                "用你自己的口气回他——别用「视频里展示了…」这种播报腔，也别复述字段名。"
-                "要是你其实没看到图，就直说你没看清。）")
-        if note:
-            hint += f"\n（页面自带的说明，仅供参考，不算你看到的：{note[:200]}）"
-        req.system_prompt = (req.system_prompt or "") + hint
-        self._last_frames[event.unified_msg_origin] = picked
-        try:
-            event.set_extra("feiyu_saw_frames", ref)
+            event.set_extra("feiyu_watch_ctx", ctx)
         except Exception:
             pass
-        logger.info(f"[feiyu_video] 画面已交给主模型: {len(picked)} 帧 · {ref[:80]}")
+        logger.info(f"[feiyu_video] 交给主模型 {handed} 份 · {ctx.brief()} · {ref[:80]}")
+        try:
+            kit.record_material(f"看了他发来的视频：{ref[:80]}", kind="event", source="video",
+                                umo=str(getattr(event, "unified_msg_origin", "") or ""),
+                                mood={"P": 2.0, "Ar": 1.2})
+        except Exception:
+            pass
 
     @staticmethod
     def _user_hint(e: Exception) -> str:
@@ -755,10 +1362,28 @@ class FeiyuVideo(Star):
                 logger.warning(f"[feiyu_video] 抽帧失败 t={t}: {e}")
         return frames
 
+    def _extract_at(self, path: str, times: list[float], width: int = 0) -> list[str]:
+        """按指定时刻抽帧（秒）。给的是 picks.plan 算出来的点，不是等间隔。"""
+        width = width or int(self.cfg.get("frame_width", 640))
+        outdir = self.data_dir / "frames" / uuid.uuid4().hex[:8]
+        outdir.mkdir(parents=True, exist_ok=True)
+        frames: list[str] = []
+        for i, t in enumerate(times):
+            out = outdir / f"f{i}.jpg"
+            cmd = [self.ffmpeg, "-y", "-ss", f"{max(0.1, float(t)):.2f}", "-i", path,
+                   "-frames:v", "1", "-vf", f"scale={width}:-2", str(out)]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=60,
+                               creationflags=SUBPROCESS_FLAGS)
+                if out.exists() and out.stat().st_size > 0:
+                    frames.append(str(out))
+            except Exception as e:
+                logger.warning(f"[feiyu_video] 定点抽帧失败 t={t}: {e}")
+        return frames
+
     # ---------- LLM 工具 ----------
 
-    @filter.llm_tool(name="watch_video")
-    async def watch_video(self, event: AstrMessageEvent, video_ref: str, question: str = "") -> str:
+    async def do_watch(self, event: AstrMessageEvent, video_ref: str, question: str = "") -> str:
         """看一段视频，把画面里的事实交给你。
 
         什么时候用：用户发来视频、**发来 B站/抖音/快手/小红书/YouTube 的页面链接**、
@@ -774,10 +1399,11 @@ class FeiyuVideo(Star):
         """
         video_ref = (video_ref or "").strip().strip("'\"")
         try:
-            if event.get_extra("feiyu_saw_frames"):
-                return "画面已经在这一轮的请求里了（你能直接看到）：按你看到的用你自己的口气回他，别复述字段名。"
+            _ctx = event.get_extra("feiyu_watch_ctx")
         except Exception:
-            pass
+            _ctx = None
+        if _ctx is not None:
+            return self._watch_result(_ctx)
         if not video_ref:
             return "他没给视频地址。问他要一下。"
 
@@ -1133,6 +1759,10 @@ class FeiyuVideo(Star):
             "type": str(facts.get("类型") or "")[:16],
             "feel": str(spoken)[:160],
         }
+        try:
+            kit.record_mood({"P": 2.5, "Ar": 1.5}, umo=str(umo), source="video")
+        except Exception:
+            pass
         with (base / f"{day}.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -1307,20 +1937,17 @@ class FeiyuVideo(Star):
                 lines.append(f"{t}｜{sm[:80]}")
         return "\n".join(lines)[:400]
 
-    @filter.llm_tool(name="identify_last_frame")
-    async def identify_last_frame(self, event: AstrMessageEvent):
+    async def _identify_last(self, event: AstrMessageEvent) -> str:
         """对刚才那个视频的画面做以图搜图（百度识图），用来认人、认场景。当用户问"这人是谁""搜搜他"时使用。"""
         frames = self._last_frames.get(event.unified_msg_origin) or []
         if not frames:
-            yield event.plain_result("我还没看过视频，没有图可搜")
-            return
+            return "还没看过视频，手上没有图可搜。"
         try:
             out = await asyncio.to_thread(self._baidu_identify, frames[0])
         except Exception as e:
             logger.error(f"[feiyu_video] 识图工具失败: {e}")
-            yield event.plain_result(f"搜图失败：{type(e).__name__}")
-            return
-        yield event.plain_result(out or "没搜到明显的匹配，可能这人网上没资料")
+            return f"搜图失败（{type(e).__name__}）。"
+        return (out or "没搜到明显的匹配，可能这人网上没资料").strip()
 
     @filter.command("识图")
     async def cmd_identify(self, event: AstrMessageEvent):
